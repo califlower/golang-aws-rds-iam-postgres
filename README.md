@@ -60,10 +60,30 @@ psql "host=$RDSHOST dbname=$DBNAME user=$USERNAME"
 ```
 
 #### Possible Error Scenarios
-Where things get annoying is in an enterprise environments, `aws sts assume-role` may fail to find either your instance metadata/the assume with an error along the lines of  `credentials not found. Use aws configure`
+Where things get annoying is in an enterprise environments, 
 
-In this case, you have to make sure that you have No Proxy Set to the sts endpoint
+`aws sts assume-role` may fail to find either your instance metadata/the assume with an error along the lines of  `credentials not found. Use aws configure`
 
+In this case, you have to make sure that you have No PROXY Set to the sts endpoint
+
+```
+export NO_PROXY=169.254.169.254
+``` 
+
+You may also want to add other endpoints such as 
+```
+export NO_PROXY=s3.amazonaws.com,localhost,127.0.0.1,169.254.169.254,10.0.0.0/8"
+```
+
+The other possibly failure appears to be if your other proxies are not set.
+
+Make sure you export the following environment variables with your proper proxies.
+```
+export https_proxy=<your enterprise aws proxy>
+export http_proxy=<your enterprise aws proxy>
+export HTTPS_PROXY=<your enterprise aws proxy>
+export HTTP_PROXY=<your enterprise aws proxy>
+```
 
 
 ###
