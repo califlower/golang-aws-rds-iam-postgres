@@ -1,7 +1,7 @@
 # How to connect to RDS Postgres using IAM Authentication in Golang (Valid as of 3/10/2020)
 
 https://gist.github.com/quiver/509e1a6e6b54a0148527553502e9f55d#file-iam_auth_psql-sh 
-This link was an incredible help, this document serves to tie most of it together and add in some other possibly relevant tips for 
+This link was an incredible help, this document serves to tie most of it together and add in some other possibly relevant tips for people struggling to setup IAM authentication for postgres in an enterprise environment.
 
 Setup an EC2 that you can ssh in to test your work out. We will start by connecting using the aws cli, as once you have gotten that working, getting Go to work is semi trivial with some gotchas.
 ### Issue
