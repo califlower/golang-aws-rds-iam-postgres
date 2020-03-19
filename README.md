@@ -75,7 +75,7 @@ You may also want to add other endpoints such as
 export NO_PROXY=s3.amazonaws.com,localhost,127.0.0.1,169.254.169.254,10.0.0.0/8"
 ```
 
-The other possibly failure appears to be if your other proxies are not set.
+The other possibly failure appears to be if your other proxies are not set. These errors usually manifest app size, when your app tries to connect to certain things.
 
 Make sure you export the following environment variables with your proper proxies.
 ```
@@ -86,7 +86,7 @@ export HTTP_PROXY=<your enterprise aws proxy>
 ```
 
 
-###
+### Setting up your Golang code
 The documentation for the go code is out of date, and all the tutorials are absolutely unhelpful in this regard.
 
 
@@ -97,6 +97,8 @@ Once you get it all setup, there are some more gotchas. The AWS SDK Will not ren
 
 Thanks to Alex on this particular issue here for helping me out with this
 https://github.com/aws/aws-sdk-go/issues/3043#issuecomment-581931580
+
+Unfortunately, even this is a little bit old. With AWS-SDK, the code to generate an auth token is no longer identical. They introduced some breaking changes.
 
 ```
 type iamDb struct {
@@ -157,14 +159,188 @@ func newConnectionPoolWithIam(awsSession *session.Session, config Config) *sqlx.
 
 Essentially you provide a custom `Connect` function that fullfills your drivers interface. This will then cause the driver to generate a new DB Auth token upon generating a new connection. 
 
+In our application, we added a few different additions that some people may find helpul. I will address them below.
+
+
 ##### Note : sqlx.NewDb and sql.OpenDB don't ping the connection to see if it works. Make sure you tack in a db.Ping() if you want to truly test that a connection was opened (for example on first run of your app) otherwise you will think things have worked when they havent
 
 IAM passwords last only 15 minutes, but an open connection will not be terminated once it reaches 15 minutes. After 15 minutes, subsequent new connections to the DB will require a new password.
 
+### Working with CNAMEs
+
+Unfortunately, IAM authentication doesn't seem to work with CNAME's. Perhaps it only works with route53 cnames, but who knows. Amazon recently released RDSProxy which works with IAM authenticaton. Unfortunately, it's not open for postgres.
+
+What I added to my code was the following.
+
+```
+cnameUntrimmed, err := lookup(ia.DatabaseHost)
+
+if err != nil {
+	log.Error(ctx, fmt.Sprintf("could not lookup cname during iam auth: %v", err))
+	return "", xerrors.Errorf("could not lookup cname during iam auth: %w", err)
+}
+//Trim the trailing dot from the cname
+cname := strings.TrimRight(cnameUntrimmed, ".")
+splitCname := strings.Split(cname, ".")
+
+if len(splitCname) != 6 {
+		return "", xerrors.New(fmt.Sprintf("cname not in AWS format, cname:%s ", cname))
+}
+
+region := splitCname[2]
+log.Info(ctx, fmt.Sprintf("opening connection to cname=%s, region=%s", cname, region))
+
+authToken, err := ia.AuthTokenGenerator.GetAuthToken(ctx, region, cname, ia.DatabasePort, ia.DatabaseUser, ia.AmazonResourceName)
+```
+
+Essentially every connection now has to do a CNAME lookup. Up to you to decide if the overhead is worth it.
+
+### Full Code Sample from a production application. Some potentially sensitive things were remove
+```
+package db
+
+import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"fmt"
+	"net"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws/external"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/aws/stscreds"
+	"github.com/aws/aws-sdk-go-v2/service/rds/rdsutils"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/jackc/pgx/v4/stdlib"
+	"github.com/jmoiron/sqlx"
+	"golang.org/x/xerrors"
+)
+
+type IAMAuth struct {
+	DatabaseUser string
+	DatabaseHost string
+	DatabasePort string
+	DatabaseName string
+	AmazonResourceName string
+	AuthTokenGenerator Generator
+}
+
+type iamDB struct {
+	IAMAuth
+}
+
+type IAMAuthGenerator struct{}
+
+type Generator interface {
+	GetAuthToken(ctx context.Context, region, cname, port, user, arn string) (string, error)
+}
+
+//If not set, database can hang for an extremely long time trying to open a new connection
+const databaseConnectionTimeoutMilliseconds = 5000
 
 
+func (iam *IAMAuthGenerator) GetAuthToken(ctx context.Context, region, cname, port, user, arn string) (string, error) {
+	cfg, err := external.LoadDefaultAWSConfig()
 
+	if err != nil {
+		return "", xerrors.Errorf("could not connect to db using iam auth: %w", err)
+	}
 
+	cfg.Region = region
+	credProvider := stscreds.NewAssumeRoleProvider(sts.New(cfg), arn)
 
+	signer := v4.NewSigner(credProvider)
 
+	ctxWithTimeout, cancel := context.WithTimeout(ctx, databaseConnectionTimeoutMilliseconds*time.Millisecond)
 
+	defer cancel()
+
+	authToken, err := rdsutils.BuildAuthToken(ctxWithTimeout,
+		fmt.Sprintf("%s:%s", cname, port),
+		region, user, signer)
+
+	return authToken, err
+}
+
+type LookupCNAME func(string) (string, error)
+
+func (ia *IAMAuth) GetConnectionString(ctx context.Context, lookup LookupCNAME) (string, error) {
+	cnameUntrimmed, err := lookup(ia.DatabaseHost)
+
+	if err != nil {
+		log.Error(ctx, fmt.Sprintf("could not lookup cname during iam auth: %v", err))
+		return "", xerrors.Errorf("could not lookup cname during iam auth: %w", err)
+	}
+	//Trim the trailing dot from the cname
+	cname := strings.TrimRight(cnameUntrimmed, ".")
+	splitCname := strings.Split(cname, ".")
+
+	if len(splitCname) != 6 {
+		return "", xerrors.New(fmt.Sprintf("cname not in AWS format, cname:%s ", cname))
+	}
+
+	region := splitCname[2]
+
+	authToken, err := ia.AuthTokenGenerator.GetAuthToken(ctx, region, cname, ia.DatabasePort, ia.DatabaseUser, ia.AmazonResourceName)
+
+	if err != nil {
+		return "", xerrors.Errorf("could not build auth token: %w", err)
+	}
+
+	var postgresConnection strings.Builder
+
+	postgresConnection.WriteString(
+		fmt.Sprintf("user=%s dbname=%s sslmode=%s port=%s host=%s password=%s",
+			ia.DatabaseUser,
+			ia.DatabaseName,
+			"require",
+			ia.DatabasePort,
+			cname,
+			authToken))
+
+	return postgresConnection.String(), nil
+
+}
+func (id *iamDB) Connect(ctx context.Context) (driver.Conn, error) {
+
+	connectionString, err := id.IAMAuth.GetConnectionString(ctx, net.LookupCNAME)
+
+	if err != nil {
+		return nil, xerrors.Errorf("could not get connection string: %w", err)
+	}
+	pgxConnector := &stdlib.Driver{}
+
+	connector, err := pgxConnector.OpenConnector(connectionString)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return connector.Connect(ctx)
+
+}
+
+func (id *iamDB) Driver() driver.Driver {
+	return id
+}
+
+// driver.Driver interface
+func (id *iamDB) Open(name string) (driver.Conn, error) {
+	return nil, xerrors.New("driver open method unsupported")
+}
+
+func (ia IAMAuth) Connect(ctx context.Context) (*sqlx.DB, error) {
+	db := sql.OpenDB(&iamDB{ia})
+
+	err := db.Ping()
+
+	if err != nil {
+		return nil, xerrors.Errorf("could not ping db: %w", err)
+	}
+
+	return sqlx.NewDb(db, driverName), nil
+}
+```
