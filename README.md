@@ -1,6 +1,7 @@
 # How to connect to RDS Postgres using IAM Authentication in Golang (Valid as of 3/10/2020)
 
-https://gist.github.com/quiver/509e1a6e6b54a0148527553502e9f55d#file-iam_auth_psql-sh 
+[User: Quiver Postgres IAM Gist](https://gist.github.com/quiver/509e1a6e6b54a0148527553502e9f55d#file-iam_auth_psql-sh) 
+
 This link was an incredible help, this document serves to tie most of it together and add in some other possibly relevant tips for people struggling to setup IAM authentication for postgres in an enterprise environment.
 
 Setup an EC2 that you can ssh in to test your work out. We will start by connecting using the aws cli, as once you have gotten that working, getting Go to work is semi trivial with some gotchas.
@@ -59,12 +60,32 @@ export PGPASSWORD="$( aws rds generate-db-auth-token  \
 psql "host=$RDSHOST dbname=$DBNAME user=$USERNAME"
 ```
 
+You will also need an IAM policy
+```
+{
+   "Version": "2012-10-17",
+   "Statement": [
+      {
+         "Effect": "Allow",
+         "Action": [
+             "rds-db:connect"
+         ],
+         "Resource": [
+             "arn:aws:rds-db:region:account-id:dbuser:dbi-resource-id/database-user-name"
+         ]
+      }
+   ]
+```
+
+Your instance will also have to have a role with this policy attached. Your instance will also need to have a role, with a policy allowing sts assume role to assume your own instance's role.
+
+
 #### Possible Error Scenarios
 Where things get annoying is in an enterprise environments, 
 
 `aws sts assume-role` may fail to find either your instance metadata/the assume with an error along the lines of  `credentials not found. Use aws configure`
 
-In this case, you have to make sure that you have No PROXY Set to the sts endpoint
+In this case, you have to make sure that you have NO PROXY Set to the sts endpoint. You can also typically append --debug to the end of aws commands to see what is failing.
 
 ```
 export NO_PROXY=169.254.169.254
@@ -75,7 +96,7 @@ You may also want to add other endpoints such as
 export NO_PROXY=s3.amazonaws.com,localhost,127.0.0.1,169.254.169.254,10.0.0.0/8"
 ```
 
-The other possibly failure appears to be if your other proxies are not set. These errors usually manifest app size, when your app tries to connect to certain things.
+The other possibly failure appears to be if your other proxies are not set. These errors usually manifest app side, when your app tries to connect to certain things.
 
 Make sure you export the following environment variables with your proper proxies.
 ```
@@ -91,14 +112,12 @@ The documentation for the go code is out of date, and all the tutorials are abso
 
 
 
-
 Once you get it all setup, there are some more gotchas. The AWS SDK Will not renew your token once it expires, so after 15 minutes your app will stop working.
 
 
-Thanks to Alex on this particular issue here for helping me out with this
-https://github.com/aws/aws-sdk-go/issues/3043#issuecomment-581931580
+Thanks to Alex on this particular issue here for helping me out with this [AWS SDK Issue 3043](https://github.com/aws/aws-sdk-go/issues/3043#issuecomment-581931580)
 
-Unfortunately, even this is a little bit old. With AWS-SDK, the code to generate an auth token is no longer identical. They introduced some breaking changes.
+Unfortunately, even this is a little bit old. With AWS-SDK, the code to generate an auth token is no longer identical. They introduced some breaking changes. Here is the code sample linked
 
 ```
 type iamDb struct {
@@ -168,7 +187,7 @@ IAM passwords last only 15 minutes, but an open connection will not be terminate
 
 ### Working with CNAMEs
 
-Unfortunately, IAM authentication doesn't seem to work with CNAME's. Perhaps it only works with route53 cnames, but who knows. Amazon recently released RDSProxy which works with IAM authenticaton. Unfortunately, it's not open for postgres.
+Unfortunately, IAM authentication doesn't seem to work with CNAME's. Perhaps it only works with route53 cnames, but who knows. Amazon recently released RDSProxy which works with IAM authenticaton. Unfortunately, it's not postgres ready.
 
 What I added to my code was the following.
 
@@ -195,7 +214,7 @@ authToken, err := ia.AuthTokenGenerator.GetAuthToken(ctx, region, cname, ia.Data
 
 Essentially every connection now has to do a CNAME lookup. Up to you to decide if the overhead is worth it.
 
-### Full Code Sample from a production application. Some potentially sensitive things were remove
+### Full Code Sample from a production application. Some potentially sensitive things were removed
 ```
 package db
 
@@ -344,3 +363,5 @@ func (ia IAMAuth) Connect(ctx context.Context) (*sqlx.DB, error) {
 	return sqlx.NewDb(db, driverName), nil
 }
 ```
+
+Feel free to open an issue with any comments
